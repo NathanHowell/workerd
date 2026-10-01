@@ -297,11 +297,6 @@ void ContextBackend<ZstdEncoderContext>::setFlush(int flush) {
 template <>
 void ContextBackend<ZstdDecoderContext>::setFlush(int flush) {}
 
-// brotli's library default (quality 11) is an order of magnitude slower than deflate; 5 is
-// comparable in speed to zlib's default level, which the deflate/gzip formats use, while
-// still compressing better.
-constexpr uint32_t BROTLI_WEB_QUALITY = 5;
-
 kj::Own<CodecBackend> newCodecBackend(
     CompressionAllocator& allocator, ZlibStream::Mode mode, CodecFormat format) {
   switch (format) {
@@ -311,14 +306,8 @@ kj::Own<CodecBackend> newCodecBackend(
       return kj::heap<ZlibBackend>(allocator, mode, format);
     case CodecFormat::BROTLI:
       switch (mode) {
-        case ZlibStream::Mode::COMPRESS: {
-          auto backend =
-              kj::heap<ContextBackend<BrotliEncoderContext>>(allocator, ZlibMode::BROTLI_ENCODE);
-          KJ_REQUIRE(
-              backend->getContext().setParams(BROTLI_PARAM_QUALITY, BROTLI_WEB_QUALITY) == kj::none,
-              "Failed to initialize compression context.");
-          return backend;
-        }
+        case ZlibStream::Mode::COMPRESS:
+          return kj::heap<ContextBackend<BrotliEncoderContext>>(allocator, ZlibMode::BROTLI_ENCODE);
         case ZlibStream::Mode::DECOMPRESS:
           return kj::heap<ContextBackend<BrotliDecoderContext>>(allocator, ZlibMode::BROTLI_DECODE);
       }
