@@ -31,6 +31,14 @@ export {
 export { allFormatsRoundTrip, pendingReadServedOnWrite } from 'round-trip';
 
 export {
+  interopWithNodeZlib,
+  scratchBufferBoundaries,
+  emptyStreams,
+  strictChecks,
+  corruptInputRejectsWrite,
+} from 'formats';
+
+export {
   byteAtATimeCompression,
   splitCompressedInput,
   allFormatsChunkedWrites,

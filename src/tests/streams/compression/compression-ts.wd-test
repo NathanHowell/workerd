@@ -22,6 +22,7 @@ const unitTests :Workerd.Config = (
         modules = CompressionModules.modules,
         compatibilityFlags = [
           "nodejs_compat",
+          "nodejs_zlib",
           "typescript_implemented_streams",
           "strict_compression_checks",
           "unhandled_rejection_after_microtask_checkpoint",

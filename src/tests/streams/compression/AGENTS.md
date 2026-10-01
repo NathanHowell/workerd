@@ -7,8 +7,8 @@ C++ implementation (`src/workerd/api/streams/compression.{h,c++}`, built on
 internal streams over the shared `api/compression.h` CodecStage) and the
 TypeScript implementation (`src/per_isolate/webstreams/compression.ts`,
 behind `typescript_implemented_streams`) are covered. The two wrap the SAME
-C++ zlib codec (the TS pair drives `utils.newCompressionCodec` handles), so
-codec output is parity by construction; divergences live in the stream
+C++ codec stage (the TS pair drives `utils.newCompressionCodec` handles),
+so codec output is parity by construction; divergences live in the stream
 wrappers.
 
 The WPT `compression/*` tests already run against both implementations
@@ -22,7 +22,7 @@ flag axis, and real-HTTP body integration via the SELF loopback binding.
 ```webidl
 [Exposed=Worker]
 interface CompressionStream {
-  constructor(DOMString format);  // 'deflate' | 'gzip' | 'deflate-raw'
+  constructor(DOMString format);  // 'deflate' | 'gzip' | 'deflate-raw' | 'brotli'
   readonly attribute ReadableStream readable;
   readonly attribute WritableStream writable;
 };
@@ -38,9 +38,9 @@ interface DecompressionStream {
   TypeScript is standalone. `readable`/`writable` placement and
   `constructor.length` (0 vs 1) follow (#5, #6).
 - The format is ToString-coerced exactly once (an object's `toString` runs
-  once, both impls); a coerced string outside the three formats throws
+  once, both impls); a coerced string outside the four formats throws
   `TypeError` "The compression format must be either 'deflate',
-  'deflate-raw' or 'gzip'." — but non-string arguments diverge (#7):
+  'deflate-raw', 'gzip' or 'brotli'." — but non-string arguments diverge (#7):
   TypeScript coerces `undefined` into that same validation failure, while
   the C++ jsg layer rejects it at the type boundary ("constructor parameter
   1 is not of type 'string'."). `null` coerces to `"null"` in both.
@@ -125,7 +125,9 @@ The C++ cell pins every date-gated flag the implementation is subject to
 (see the comment in `compression-cpp.wd-test`); the TS cell pins only
 `strict_compression_checks` (consulted by the shared codec factory),
 `unhandled_rejection_after_microtask_checkpoint` (isolate-level event
-timing), and the internal-testing `expose_draining_reader`.
+timing), and the internal-testing `expose_draining_reader`. Both main
+cells also pin `nodejs_zlib`, which `formats.js` uses for its reference
+codecs; it has no effect on the classes under test.
 
 `compression-cpp-pedantic.wd-test` runs the full shared module set with the
 dateless opt-in `pedantic_wpt` flag added to the main C++ cell's pinned
@@ -172,6 +174,7 @@ pedantic branches shifting anything the suite pins.
 | `api-surface.js` | toStringTag branding; codec factory not exposed; side stability; inheritance/placement (#5); ctor name/length/source (#6); `node:stream/web` re-exports are the same classes; accessor brand checks |
 | `construction.js` | valid formats; invalid format exact message (case-sensitive); one-shot ToString coercion; non-string formats (#7) |
 | `round-trip.js` | all-formats round trips (compression verified smaller); parked-read service with pinned deflate bytes; shared pump/concat/readAll helpers |
+| `formats.js` | the non-zlib formats (brotli): interop with node:zlib's reference codecs in both directions; 16 KiB scratch-buffer boundary sizes; empty streams; strict trailing/incomplete-close messages; corrupt input |
 | `chunk-boundaries.js` | byte-at-a-time compression; 2-byte split decompression; all formats with 5-byte write chunks |
 | `large-payload.js` | 400KB patterned payload, chunked writes, byte-exact round trip |
 | `empty-stream.js` | close-with-no-writes emits a valid empty member; decompressing it yields EOF |

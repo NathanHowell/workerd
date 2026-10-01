@@ -142,7 +142,7 @@ class ZlibStream final {
 // asked for) is therefore NOT valid on any frontend where write settlement is observable; it
 // remains a possible future policy for fused native pipelines that own both ends.
 // The Compression Streams formats: the spec's CompressionFormat enum.
-enum class CodecFormat { DEFLATE, DEFLATE_RAW, GZIP };
+enum class CodecFormat { DEFLATE, DEFLATE_RAW, GZIP, BROTLI };
 
 // The frontends' shared constructor-argument validation: maps the (already ToString-coerced)
 // format to a CodecFormat, throwing the spec-pinned TypeError for anything else.
