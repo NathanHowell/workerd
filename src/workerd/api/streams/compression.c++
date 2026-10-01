@@ -22,7 +22,7 @@ class CompressionStreamImpl final: public kj::Refcounted,
                                    public capnp::ExplicitEndOutputStream {
  public:
   explicit CompressionStreamImpl(CodecStage::Mode mode,
-      kj::String format,
+      CodecFormat format,
       CodecStage::Flags flags,
       kj::Arc<const jsg::ExternalMemoryTarget>&& externalMemoryTarget)
       : stage(mode, format, flags, kj::mv(externalMemoryTarget)),
@@ -379,11 +379,8 @@ class CompressionStreamAdapter final: public kj::Refcounted,
 // NOLINTBEGIN(workerd-legacy-stream-alloc)
 
 jsg::Ref<CompressionStream> CompressionStream::constructor(jsg::Lock& js, kj::String format) {
-  JSG_REQUIRE(format == "deflate" || format == "gzip" || format == "deflate-raw", TypeError,
-      "The compression format must be either 'deflate', 'deflate-raw' or 'gzip'.");
-
-  auto impl = kj::rc<CompressionStreamImpl>(CodecStage::Mode::COMPRESS, kj::mv(format),
-      CodecStage::Flags::NONE, js.getExternalMemoryTarget());
+  auto impl = kj::rc<CompressionStreamImpl>(CodecStage::Mode::COMPRESS,
+      requireCodecFormat(js, format), CodecStage::Flags::NONE, js.getExternalMemoryTarget());
 
   auto& ioContext = IoContext::current();
 
@@ -398,13 +395,11 @@ jsg::Ref<CompressionStream> CompressionStream::constructor(jsg::Lock& js, kj::St
 }
 
 jsg::Ref<DecompressionStream> DecompressionStream::constructor(jsg::Lock& js, kj::String format) {
-  JSG_REQUIRE(format == "deflate" || format == "gzip" || format == "deflate-raw", TypeError,
-      "The compression format must be either 'deflate', 'deflate-raw' or 'gzip'.");
-
-  auto impl = kj::rc<CompressionStreamImpl>(CodecStage::Mode::DECOMPRESS, kj::mv(format),
-      FeatureFlags::get(js).getStrictCompression() ? CodecStage::Flags::STRICT
-                                                   : CodecStage::Flags::NONE,
-      js.getExternalMemoryTarget());
+  auto impl =
+      kj::rc<CompressionStreamImpl>(CodecStage::Mode::DECOMPRESS, requireCodecFormat(js, format),
+          FeatureFlags::get(js).getStrictCompression() ? CodecStage::Flags::STRICT
+                                                       : CodecStage::Flags::NONE,
+          js.getExternalMemoryTarget());
 
   auto& ioContext = IoContext::current();
 
