@@ -166,59 +166,113 @@ kj::StringPtr ZlibStream::errorCodeName(int code) {
   }
 }
 
-kj::Maybe<int> ZlibStream::windowBitsForWebFormat(kj::StringPtr format) {
-  // 15 is the default value of the windowBits parameter for zlib; adding 16 selects the
-  // gzip wrapper, and negating selects a raw (headerless) stream.
-  if (format == "gzip"_kj) return 15 + 16;
-  if (format == "deflate"_kj) return 15;
-  if (format == "deflate-raw"_kj) return -15;
-  return kj::none;
-}
-
 // =======================================================================================
 // CodecStage
 
-CodecStage::Context::Context(Mode mode,
-    kj::StringPtr format,
-    Flags flags,
-    kj::Arc<const jsg::ExternalMemoryTarget>&& externalMemoryTarget)
-    : allocator(kj::mv(externalMemoryTarget)),
-      stream(allocator),
-      strictCompression(flags) {
-  auto windowBits = KJ_ASSERT_NONNULL(ZlibStream::windowBitsForWebFormat(format));
-  JSG_REQUIRE(stream.init(mode, ZlibStream::Options{.windowBits = windowBits}) == kj::none, Error,
-      "Failed to initialize compression context."_kj);
+CodecFormat requireCodecFormat(jsg::Lock& js, kj::StringPtr format) {
+  if (format == "deflate") return CodecFormat::DEFLATE;
+  if (format == "deflate-raw") return CodecFormat::DEFLATE_RAW;
+  if (format == "gzip") return CodecFormat::GZIP;
+  JSG_FAIL_REQUIRE(
+      TypeError, "The compression format must be either 'deflate', 'deflate-raw' or 'gzip'.");
 }
 
-void CodecStage::Context::setInput(const void* in, size_t size) {
-  stream.setInput(kj::arrayPtr(reinterpret_cast<const kj::byte*>(in), size));
+namespace {
+
+// deflate/inflate over the shared ZlibStream core.
+class ZlibBackend final: public CodecBackend {
+ public:
+  ZlibBackend(CompressionAllocator& allocator, ZlibStream::Mode mode, CodecFormat format)
+      : stream(allocator) {
+    KJ_REQUIRE(
+        stream.init(mode, ZlibStream::Options{.windowBits = windowBitsFor(format)}) == kj::none,
+        "Failed to initialize compression context.");
+  }
+
+  void setInput(kj::ArrayPtr<const kj::byte> input) override {
+    stream.setInput(input);
+  }
+
+  Step step(int flush, kj::ArrayPtr<kj::byte> output) override {
+    stream.setOutput(output);
+    int result = stream.run(flush);
+    return Step{
+      .error = !(result == Z_OK || result == Z_BUF_ERROR || result == Z_STREAM_END),
+      // Z_OK with no output still means input was consumed into the window; pump again.
+      .progress = result == Z_OK,
+      .streamEnd = result == Z_STREAM_END,
+      // zlib reports Z_BUF_ERROR when it can make no progress; with the whole scratch buffer
+      // available that means it is waiting for input.
+      .needsInput = result == Z_BUF_ERROR,
+      .buffer = output.first(output.size() - stream.availOut()),
+    };
+  }
+
+  size_t availIn() const override {
+    return stream.availIn();
+  }
+
+ private:
+  // 15 is the default value of the windowBits parameter for zlib; adding 16 selects the
+  // gzip wrapper, and negating selects a raw (headerless) stream.
+  static int windowBitsFor(CodecFormat format) {
+    switch (format) {
+      case CodecFormat::DEFLATE:
+        return 15;
+      case CodecFormat::DEFLATE_RAW:
+        return -15;
+      case CodecFormat::GZIP:
+        return 15 + 16;
+    }
+    KJ_UNREACHABLE;
+  }
+
+  ZlibStream stream;
+};
+
+kj::Own<CodecBackend> newCodecBackend(
+    CompressionAllocator& allocator, ZlibStream::Mode mode, CodecFormat format) {
+  switch (format) {
+    case CodecFormat::DEFLATE:
+    case CodecFormat::DEFLATE_RAW:
+    case CodecFormat::GZIP:
+      return kj::heap<ZlibBackend>(allocator, mode, format);
+  }
+  KJ_UNREACHABLE;
+}
+
+}  // namespace
+
+CodecStage::Context::Context(Mode mode,
+    CodecFormat format,
+    Flags flags,
+    kj::Arc<const jsg::ExternalMemoryTarget>&& externalMemoryTarget)
+    : mode(mode),
+      allocator(kj::mv(externalMemoryTarget)),
+      backend(newCodecBackend(allocator, mode, format)),
+      strictCompression(flags) {}
+
+void CodecStage::Context::setInput(kj::ArrayPtr<const kj::byte> input) {
+  backend->setInput(input);
 }
 
 CodecStage::Context::Result CodecStage::Context::pumpOnce(int flush) {
-  stream.setOutput(kj::arrayPtr(buffer, sizeof(buffer)));
+  auto result = backend->step(flush, kj::arrayPtr(buffer, sizeof(buffer)));
 
-  int result = stream.run(flush);
-
-  switch (stream.getMode()) {
+  switch (mode) {
     case Mode::COMPRESS:
-      JSG_REQUIRE(result == Z_OK || result == Z_BUF_ERROR || result == Z_STREAM_END, TypeError,
-          "Compression failed.");
+      JSG_REQUIRE(!result.error, TypeError, "Compression failed.");
       break;
     case Mode::DECOMPRESS:
-      JSG_REQUIRE(result == Z_OK || result == Z_BUF_ERROR || result == Z_STREAM_END, TypeError,
-          "Decompression failed.");
+      JSG_REQUIRE(!result.error, TypeError, "Decompression failed.");
       break;
   }
 
-  return Result{
-    .success = result == Z_OK,
-    .result = result,
-    .buffer = kj::arrayPtr(buffer, sizeof(buffer) - stream.availOut()),
-  };
+  return result;
 }
 
 void CodecStage::Context::enforceStrictChecks(int flush, const Result& result) {
-  if (stream.getMode() != Mode::DECOMPRESS || strictCompression != Flags::STRICT) {
+  if (mode != Mode::DECOMPRESS || strictCompression != Flags::STRICT) {
     return;
   }
   // The spec requires that a TypeError is produced if there is trailing data after the end
@@ -226,11 +280,11 @@ void CodecStage::Context::enforceStrictChecks(int flush, const Result& result) {
   // the final valid bytes (produced by the very pump step that observed the trailing junk)
   // are still delivered to any read that consumes them before the error lands, which is the
   // WPT-pinned observable order.
-  JSG_REQUIRE(!(result.result == Z_STREAM_END && stream.availIn() > 0), TypeError,
+  JSG_REQUIRE(!(result.streamEnd && backend->availIn() > 0), TypeError,
       "Trailing bytes after end of compressed data");
   // Same applies to closing a stream before the complete decompressed data is available.
-  JSG_REQUIRE(!(flush == Z_FINISH && result.result == Z_BUF_ERROR && result.buffer.size() == 0),
-      TypeError, "Called close() on a decompression stream with incomplete data");
+  JSG_REQUIRE(!(flush == Z_FINISH && result.needsInput && result.buffer.size() == 0), TypeError,
+      "Called close() on a decompression stream with incomplete data");
 }
 
 void CodecStage::OutputBuffer::write(kj::ArrayPtr<const kj::byte> chunk) {
@@ -265,13 +319,13 @@ void CodecStage::OutputBuffer::clear() {
 }
 
 CodecStage::CodecStage(Mode mode,
-    kj::StringPtr format,
+    CodecFormat format,
     Flags flags,
     kj::Arc<const jsg::ExternalMemoryTarget>&& externalMemoryTarget)
     : context(mode, format, flags, kj::mv(externalMemoryTarget)) {}
 
 void CodecStage::push(kj::ArrayPtr<const kj::byte> input) {
-  context.setInput(input.begin(), input.size());
+  context.setInput(input);
   pump(Z_NO_FLUSH);
 }
 
@@ -307,12 +361,7 @@ void CodecStage::pump(int flush) {
       output.write(result.buffer);
     }
     context.enforceStrictChecks(flush, result);
-    if (result.buffer.size() == 0) {
-      if (result.success) {
-        // No output produced but input data has been processed based on the zlib return
-        // code; call pumpOnce again.
-        continue;
-      }
+    if (result.buffer.size() == 0 && !result.progress) {
       return;
     }
   }
@@ -323,7 +372,7 @@ void CodecStage::pump(int flush) {
 // CompressionCodec
 
 CompressionCodec::CompressionCodec(CodecStage::Mode mode,
-    kj::StringPtr format,
+    CodecFormat format,
     CodecStage::Flags flags,
     kj::Arc<const jsg::ExternalMemoryTarget>&& externalMemoryTarget)
     : stage(mode, format, flags, kj::mv(externalMemoryTarget)) {}
@@ -360,10 +409,8 @@ void newCompressionCodecCallback(const v8::FunctionCallbackInfo<v8::Value>& info
     auto formatStr = JSG_REQUIRE_NONNULL(jsg::JsValue(info[1]).tryCast<jsg::JsString>(), TypeError,
         "newCompressionCodec() expects a string format argument");
     auto mode = modeStr.toString(js);
-    auto format = formatStr.toString(js);
+    auto format = requireCodecFormat(js, formatStr.toString(js));
 
-    JSG_REQUIRE(format == "deflate" || format == "gzip" || format == "deflate-raw", TypeError,
-        "The compression format must be either 'deflate', 'deflate-raw' or 'gzip'.");
     CodecStage::Mode codecMode;
     CodecStage::Flags codecFlags = CodecStage::Flags::NONE;
     if (mode == "compress") {

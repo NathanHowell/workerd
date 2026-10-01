@@ -120,10 +120,6 @@ class ZlibStream final {
   // unrecognized codes.
   static kj::StringPtr errorCodeName(int code);
 
-  // Maps a Compression Streams spec format ("gzip" | "deflate" | "deflate-raw") to its
-  // windowBits value; kj::none for anything else.
-  static kj::Maybe<int> windowBitsForWebFormat(kj::StringPtr format);
-
  private:
   z_stream stream = {};
   Mode mode = Mode::COMPRESS;
@@ -145,6 +141,44 @@ class ZlibStream final {
 // timing is observable and WPT-pinned. Demand-paced production (pump only what a reader
 // asked for) is therefore NOT valid on any frontend where write settlement is observable; it
 // remains a possible future policy for fused native pipelines that own both ends.
+// The Compression Streams formats: the spec's CompressionFormat enum.
+enum class CodecFormat { DEFLATE, DEFLATE_RAW, GZIP };
+
+// The frontends' shared constructor-argument validation: maps the (already ToString-coerced)
+// format to a CodecFormat, throwing the spec-pinned TypeError for anything else.
+CodecFormat requireCodecFormat(jsg::Lock& js, kj::StringPtr format);
+
+// One codec library behind the stage: the input/output plumbing and a single codec step, in
+// codec-neutral terms. Implementations live in compression.c++.
+class CodecBackend {
+ public:
+  virtual ~CodecBackend() noexcept(false) = default;
+
+  struct Step {
+    // The library reported a failure; the stage maps this to the spec's TypeError.
+    bool error = false;
+    // The codec can make further progress with the input it has: the output buffer filled,
+    // or the library still has buffered input to process. Pump again.
+    bool progress = false;
+    // The compressed stream has ended: a decompressor saw the end of the final member/frame,
+    // a compressor flushed it.
+    bool streamEnd = false;
+    // The codec stopped because it ran out of input before the stream ended.
+    bool needsInput = false;
+    // The output this step produced.
+    kj::ArrayPtr<const kj::byte> buffer;
+  };
+
+  virtual void setInput(kj::ArrayPtr<const kj::byte> input) = 0;
+
+  // One codec step into `output`. `flush` is Z_NO_FLUSH or Z_FINISH; backends translate to
+  // their own library's notion of finishing.
+  virtual Step step(int flush, kj::ArrayPtr<kj::byte> output) = 0;
+
+  // Input bytes the codec has not consumed.
+  virtual size_t availIn() const = 0;
+};
+
 class CodecStage final {
  public:
   using Mode = ZlibStream::Mode;
@@ -156,10 +190,8 @@ class CodecStage final {
     STRICT,
   };
 
-  // `format` must be a valid web format ("gzip" | "deflate" | "deflate-raw"); the
-  // JS-visible format validation (with its spec-pinned TypeError) belongs to the frontends.
   explicit CodecStage(Mode mode,
-      kj::StringPtr format,
+      CodecFormat format,
       Flags flags,
       kj::Arc<const jsg::ExternalMemoryTarget>&& externalMemoryTarget);
   KJ_DISALLOW_COPY_AND_MOVE(CodecStage);
@@ -185,32 +217,29 @@ class CodecStage final {
   void clear();
 
  private:
-  // The per-pump policy layer: one deflate()/inflate() step into the scratch buffer, with
-  // the spec's TypeErrors applied to the result. The strict-mode checks are a separate step
+  // The per-pump policy layer: one backend step into the scratch buffer, with the spec's
+  // TypeErrors applied to the result. The strict-mode checks are a separate step
   // (enforceStrictChecks) so the stage can buffer an erroring iteration's output BEFORE the
   // strict error throws — the final valid bytes are still deliverable, per the WPT-pinned
   // output-then-error order.
   class Context {
    public:
-    struct Result {
-      bool success = false;
-      int result = Z_OK;
-      kj::ArrayPtr<const kj::byte> buffer;
-    };
+    using Result = CodecBackend::Step;
 
     explicit Context(Mode mode,
-        kj::StringPtr format,
+        CodecFormat format,
         Flags flags,
         kj::Arc<const jsg::ExternalMemoryTarget>&& externalMemoryTarget);
     KJ_DISALLOW_COPY_AND_MOVE(Context);
 
-    void setInput(const void* in, size_t size);
+    void setInput(kj::ArrayPtr<const kj::byte> input);
     Result pumpOnce(int flush);
     void enforceStrictChecks(int flush, const Result& result);
 
    private:
+    Mode mode;
     CompressionAllocator allocator;
-    ZlibStream stream;
+    kj::Own<CodecBackend> backend;
     kj::byte buffer[16384];
 
     // For the eponymous compatibility flag
@@ -265,7 +294,7 @@ class CodecStage final {
 class CompressionCodec final: public jsg::Object {
  public:
   CompressionCodec(CodecStage::Mode mode,
-      kj::StringPtr format,
+      CodecFormat format,
       CodecStage::Flags flags,
       kj::Arc<const jsg::ExternalMemoryTarget>&& externalMemoryTarget);
 
