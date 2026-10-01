@@ -1,3 +1,9 @@
+> [!CAUTION]
+> **TEMPORARY FILE: DELETE THIS FILE FROM GIT BEFORE SUBMITTING A PR.**
+> It is a working bug report for the branch that adds the zstd boundary tests,
+> and must not be merged. Remove it with
+> `git rm src/workerd/api/node/tests/zlib-zstd-buffer-boundary-bugs.md`.
+
 # node:zlib zstd: output-buffer-boundary bugs
 
 Findings from writing `zlib-zstd-buffer-boundary-test.js`, which registers as
