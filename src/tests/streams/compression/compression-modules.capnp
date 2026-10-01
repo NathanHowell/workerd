@@ -12,6 +12,7 @@ const modules :List(Workerd.Worker.Module) = [
   (name = "api-surface", esModule = embed "api-surface.js"),
   (name = "construction", esModule = embed "construction.js"),
   (name = "round-trip", esModule = embed "round-trip.js"),
+  (name = "formats", esModule = embed "formats.js"),
   (name = "chunk-boundaries", esModule = embed "chunk-boundaries.js"),
   (name = "large-payload", esModule = embed "large-payload.js"),
   (name = "empty-stream", esModule = embed "empty-stream.js"),

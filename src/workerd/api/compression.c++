@@ -173,8 +173,9 @@ CodecFormat requireCodecFormat(jsg::Lock& js, kj::StringPtr format) {
   if (format == "deflate") return CodecFormat::DEFLATE;
   if (format == "deflate-raw") return CodecFormat::DEFLATE_RAW;
   if (format == "gzip") return CodecFormat::GZIP;
-  JSG_FAIL_REQUIRE(
-      TypeError, "The compression format must be either 'deflate', 'deflate-raw' or 'gzip'.");
+  if (format == "brotli") return CodecFormat::BROTLI;
+  JSG_FAIL_REQUIRE(TypeError,
+      "The compression format must be either 'deflate', 'deflate-raw', 'gzip' or 'brotli'.");
 }
 
 namespace {
@@ -230,6 +231,68 @@ class ZlibBackend final: public CodecBackend {
   ZlibStream stream;
 };
 
+// The other codec libraries, over the node:zlib-shaped contexts below. Decoders are never given
+// a finish directive: the stage's own strict checks decide what an incomplete stream means, so
+// the contexts' finish-time truncation heuristics (Node semantics) stay out of the way.
+template <typename Context>
+class ContextBackend final: public CodecBackend {
+ public:
+  template <typename... Params>
+  explicit ContextBackend(Params&&... params): context(kj::fwd<Params>(params)...) {}
+
+  Context& getContext() {
+    return context;
+  }
+
+  void setInput(kj::ArrayPtr<const kj::byte> input) override {
+    context.setInputBuffer(input);
+  }
+
+  Step step(int flush, kj::ArrayPtr<kj::byte> output) override {
+    context.setOutputBuffer(output);
+    setFlush(flush);
+    context.work();
+
+    uint32_t availIn = 0;
+    uint32_t availOut = 0;
+    context.getAfterWriteResult(&availIn, &availOut);
+    bool streamEnd = context.isStreamEnd();
+    return Step{
+      .error = context.getError() != kj::none,
+      // A full output buffer may be hiding more output, and input left unconsumed before the
+      // end of the stream is still to be processed.
+      .progress = availOut == 0 || (!streamEnd && availIn > 0),
+      .streamEnd = streamEnd,
+      .needsInput = !streamEnd && availIn == 0 && availOut > 0,
+      .buffer = output.first(output.size() - availOut),
+    };
+  }
+
+  size_t availIn() const override {
+    uint32_t availIn = 0;
+    uint32_t availOut = 0;
+    context.getAfterWriteResult(&availIn, &availOut);
+    return availIn;
+  }
+
+ private:
+  void setFlush(int flush);
+
+  Context context;
+};
+
+template <>
+void ContextBackend<BrotliEncoderContext>::setFlush(int flush) {
+  context.setFlush(flush == Z_FINISH ? BROTLI_OPERATION_FINISH : BROTLI_OPERATION_PROCESS);
+}
+template <>
+void ContextBackend<BrotliDecoderContext>::setFlush(int flush) {}
+
+// brotli's library default (quality 11) is an order of magnitude slower than deflate; 5 is
+// comparable in speed to zlib's default level, which the deflate/gzip formats use, while
+// still compressing better.
+constexpr uint32_t BROTLI_WEB_QUALITY = 5;
+
 kj::Own<CodecBackend> newCodecBackend(
     CompressionAllocator& allocator, ZlibStream::Mode mode, CodecFormat format) {
   switch (format) {
@@ -237,6 +300,20 @@ kj::Own<CodecBackend> newCodecBackend(
     case CodecFormat::DEFLATE_RAW:
     case CodecFormat::GZIP:
       return kj::heap<ZlibBackend>(allocator, mode, format);
+    case CodecFormat::BROTLI:
+      switch (mode) {
+        case ZlibStream::Mode::COMPRESS: {
+          auto backend =
+              kj::heap<ContextBackend<BrotliEncoderContext>>(allocator, ZlibMode::BROTLI_ENCODE);
+          KJ_REQUIRE(
+              backend->getContext().setParams(BROTLI_PARAM_QUALITY, BROTLI_WEB_QUALITY) == kj::none,
+              "Failed to initialize compression context.");
+          return backend;
+        }
+        case ZlibStream::Mode::DECOMPRESS:
+          return kj::heap<ContextBackend<BrotliDecoderContext>>(allocator, ZlibMode::BROTLI_DECODE);
+      }
+      KJ_UNREACHABLE;
   }
   KJ_UNREACHABLE;
 }
