@@ -617,10 +617,21 @@ void ZstdEncoderContext::work() {
   JSG_REQUIRE(mode == ZlibMode::ZSTD_ENCODE, Error, "Mode should be ZSTD_ENCODE"_kj);
   JSG_REQUIRE(cctx_.get() != nullptr, Error, "Zstd context should not be null"_kj);
 
+  // Once a frame has been ended, ZSTD_compressStream2() starts a new frame on the next call,
+  // so calling it with no input would emit a spurious empty frame. Callers re-invoke work()
+  // whenever the previous call filled the output buffer, so that case must be a no-op.
+  if (frameComplete_ && input_.pos >= input_.size) {
+    return;
+  }
+
   lastResult = ZSTD_compressStream2(cctx_.get(), &output_, &input_, flush_);
 
   if (ZSTD_isError(lastResult)) {
     error_ = ZSTD_getErrorCode(lastResult);
+  } else {
+    // With ZSTD_e_end, a return of 0 means the frame is complete and fully flushed; any
+    // other value means more output space is needed to finish it.
+    frameComplete_ = (flush_ == ZSTD_e_end && lastResult == 0);
   }
 }
 
@@ -631,6 +642,7 @@ kj::Maybe<CompressionError> ZstdEncoderContext::resetStream() {
       return kj::mv(err);
     }
   }
+  frameComplete_ = false;
   return kj::none;
 }
 
@@ -651,17 +663,11 @@ kj::Maybe<CompressionError> ZstdEncoderContext::getError() const {
         kj::str("ERR_ZSTD_COMPRESSION_FAILED"), -1);
   }
 
-  if (flush_ == ZSTD_e_end && lastResult != 0) {
-    // lastResult > 0 means more output is needed, which shouldn't happen at end
-    return CompressionError("Unexpected end of file"_kj, "Z_BUF_ERROR"_kj, Z_BUF_ERROR);
-  }
-
   return kj::none;
 }
 
 bool ZstdEncoderContext::isStreamEnd() const {
-  // ZSTD_compressStream2 returns 0 when flush_ == ZSTD_e_end and the frame is fully flushed.
-  return !ZSTD_isError(lastResult) && lastResult == 0;
+  return frameComplete_;
 }
 
 ZstdDecoderContext::ZstdDecoderContext(ZlibMode _mode)
