@@ -32,7 +32,7 @@ const ZSTD_MAGIC = 0xfd2fb528;
 const MAX_BLOCK_SIZE = 128 * 1024;
 
 // Output buffer boundaries (cumulative capacity of the growable buffer).
-const BOUNDARIES = [BASE, BASE * 2, BASE * 4, BASE * 8, BASE * 16];
+const BOUNDARIES = [BASE, BASE * 2, BASE * 4, BASE * 8, BASE * 16, BASE * 32];
 // Offsets around each boundary. Frame overhead moves the compressed-size
 // boundary relative to the raw-size boundary, so we look on both sides.
 const DELTAS = [-32, -16, -1, 0, 1, 16, 32];

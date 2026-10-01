@@ -25,6 +25,18 @@ Related: cloudflare/workerd#6769 (compress), PR #6773 (partial compress fix).
   It is very likely the same `getError()` check (see Bug 1), but that is an
   inference.
 
+## Where this was observed
+
+Seen on workerd 1.20260701.1 and 1.20260928.1 with compat date 2026-02-20, in
+both `wrangler dev --local` and production. Workers has no zstd
+`CompressionStream` or `DecompressionStream`, so `node:zlib` is the only native
+zstd path. In production, Bug 2 hit about 2-3% of requests for one workload
+(PMTiles directories that decompress to exactly 40,960 bytes). A local
+measurement over 810 frames from 4 KB to 1.3 MB, random and repetitive, found
+that the frames that threw were exactly the 40960 × 2^k sizes, and that no
+frame ever decoded to wrong bytes. A failure is always a throw. Bug 1 was first
+seen on tiles whose compressed output was over roughly 64 KB.
+
 ## Background
 
 The sync and callback zstd paths run `syncProcessBuffer` in
@@ -55,6 +67,13 @@ The encoder and decoder contexts, including `getError()`, are in
   8192 and smaller pass), and fails for every `chunkSize` tried (64, 1024, 16384,
   65536) at 100 KiB. This matches the stream's own 16 KiB output chunk.
 - Compressible input (constant bytes) is not affected at any size.
+- **The trigger is the output size, not the exact boundary.** The original
+  report suspected the 40960-byte boundary rather than a size threshold. The
+  results say it is a threshold: the compressed output must exceed the first
+  40960-byte chunk. Random input fails at every size from about 40951 bytes up
+  to 1 MiB, which also explains the roughly 64 KB figure seen in production.
+  Sizes near 40960 × 2^k are only special for the spurious trailing frame below
+  and for Bug 2.
 
 ### Cause
 
@@ -85,7 +104,7 @@ call for whoever fixes this.
 ### Observed behaviour
 
 - A valid frame whose decompressed size is exactly 40960 × 2^k bytes fails with
-  `unexpected end of file`. Sizes tested: 40960, 81920, 163840, 327680, 655360.
+  `unexpected end of file`. Sizes tested: 40960, 81920, 163840, 327680, 655360, 1310720.
 - The tests build frames by hand from raw and RLE blocks, with no compressor
   involved. In every variant, **only** the exact boundary sizes fail. All
   neighbouring sizes (±1, ±16, ±32) decode correctly. The variants are random and
