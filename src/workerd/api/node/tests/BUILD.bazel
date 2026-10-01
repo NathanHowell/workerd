@@ -255,6 +255,13 @@ wd_test(
 )
 
 wd_test(
+    size = "large",
+    src = "zlib-zstd-buffer-boundary-test.wd-test",
+    args = ["--experimental"],
+    data = ["zlib-zstd-buffer-boundary-test.js"],
+)
+
+wd_test(
     src = "zlib-resizable-ab-test.wd-test",
     args = ["--experimental"],
     data = ["zlib-resizable-ab-test.js"],
