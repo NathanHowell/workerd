@@ -1686,4 +1686,12 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   # key encapsulation helpers, getPublicKey(), SubtleCrypto.supports(), and AKP JWK support. It is
   # explicitly gated because the draft is still changing and workerd does not implement the full
   # proposal. The API may change as the draft evolves.
+
+  compressionStreamZstd @192 :Bool
+      $compatEnableFlag("compression_stream_zstd");
+  # Accepts "zstd" as a CompressionStream/DecompressionStream format. Zstandard is not part of
+  # the Compression Streams standard, so this is opt-in; the format name or details of its
+  # behavior may change if the standard adopts it. A DecompressionStream decodes every frame of
+  # a concatenated zstd stream, and bytes after the last frame that do not start another frame
+  # fail as corrupt input rather than as trailing data.
 }

@@ -3,7 +3,8 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 // Constructor format validation: exactly 'deflate', 'gzip', 'deflate-raw',
-// 'brotli'.
+// 'brotli', and 'zstd' under the compression_stream_zstd flag (pinned in the
+// main cells; the legacy cell asserts its absence).
 // Divergence for non-string (including missing) formats: TypeScript
 // ToString-coerces the argument and fails format validation, while the C++
 // jsg layer rejects non-strings at the type boundary before validation.
@@ -16,7 +17,7 @@ const formatMessage =
 
 export const validFormatsConstruct = {
   test() {
-    for (const format of ['deflate', 'gzip', 'deflate-raw', 'brotli']) {
+    for (const format of ['deflate', 'gzip', 'deflate-raw', 'brotli', 'zstd']) {
       ok(new CompressionStream(format));
       ok(new DecompressionStream(format));
     }

@@ -35,6 +35,7 @@ const unitTests :Workerd.Config = (
         compatibilityFlags = [
           "nodejs_compat",
           "nodejs_zlib",
+          "compression_stream_zstd",
           "strict_compression_checks",
           "unhandled_rejection_after_microtask_checkpoint",
           "streams_enable_constructors",

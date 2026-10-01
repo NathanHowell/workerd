@@ -174,6 +174,9 @@ CodecFormat requireCodecFormat(jsg::Lock& js, kj::StringPtr format) {
   if (format == "deflate-raw") return CodecFormat::DEFLATE_RAW;
   if (format == "gzip") return CodecFormat::GZIP;
   if (format == "brotli") return CodecFormat::BROTLI;
+  if (format == "zstd" && FeatureFlags::get(js).getCompressionStreamZstd()) {
+    return CodecFormat::ZSTD;
+  }
   JSG_FAIL_REQUIRE(TypeError,
       "The compression format must be either 'deflate', 'deflate-raw', 'gzip' or 'brotli'.");
 }
@@ -287,6 +290,12 @@ void ContextBackend<BrotliEncoderContext>::setFlush(int flush) {
 }
 template <>
 void ContextBackend<BrotliDecoderContext>::setFlush(int flush) {}
+template <>
+void ContextBackend<ZstdEncoderContext>::setFlush(int flush) {
+  context.setFlush(flush == Z_FINISH ? ZSTD_e_end : ZSTD_e_continue);
+}
+template <>
+void ContextBackend<ZstdDecoderContext>::setFlush(int flush) {}
 
 // brotli's library default (quality 11) is an order of magnitude slower than deflate; 5 is
 // comparable in speed to zlib's default level, which the deflate/gzip formats use, while
@@ -312,6 +321,14 @@ kj::Own<CodecBackend> newCodecBackend(
         }
         case ZlibStream::Mode::DECOMPRESS:
           return kj::heap<ContextBackend<BrotliDecoderContext>>(allocator, ZlibMode::BROTLI_DECODE);
+      }
+      KJ_UNREACHABLE;
+    case CodecFormat::ZSTD:
+      switch (mode) {
+        case ZlibStream::Mode::COMPRESS:
+          return kj::heap<ContextBackend<ZstdEncoderContext>>(ZlibMode::ZSTD_ENCODE);
+        case ZlibStream::Mode::DECOMPRESS:
+          return kj::heap<ContextBackend<ZstdDecoderContext>>(ZlibMode::ZSTD_DECODE);
       }
       KJ_UNREACHABLE;
   }
@@ -834,6 +851,7 @@ void ZstdDecoderContext::work() {
 
   // lastResult > 0 means the decoder needs more input or output to finish the current frame.
   frameInProgress_ = (lastResult > 0);
+  frameComplete_ = !frameInProgress_;
 }
 
 kj::Maybe<CompressionError> ZstdDecoderContext::resetStream() {
@@ -844,6 +862,7 @@ kj::Maybe<CompressionError> ZstdDecoderContext::resetStream() {
     }
   }
   frameInProgress_ = false;
+  frameComplete_ = false;
   return kj::none;
 }
 
@@ -874,8 +893,9 @@ kj::Maybe<CompressionError> ZstdDecoderContext::getError() const {
 }
 
 bool ZstdDecoderContext::isStreamEnd() const {
-  // ZSTD_decompressStream returns 0 when a frame is completely decoded and fully flushed.
-  return !ZSTD_isError(lastResult) && lastResult == 0;
+  // True once at least one frame has been completely decoded and flushed with none in
+  // progress; false before any input has been decoded.
+  return frameComplete_;
 }
 
 }  // namespace workerd::api

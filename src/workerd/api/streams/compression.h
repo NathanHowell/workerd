@@ -20,6 +20,8 @@ class CompressionStream: public TransformStream {
 
   JSG_RESOURCE_TYPE(CompressionStream) {
     JSG_INHERIT(TransformStream);
+    // "zstd" (behind compression_stream_zstd) is deliberately absent from the type: the flag
+    // is opt-in and the generated types cannot vary by it.
 
     JSG_TS_OVERRIDE(extends TransformStream<ArrayBuffer | ArrayBufferView, Uint8Array> { constructor(format
                                  : "gzip" | "deflate" | "deflate-raw" | "brotli");

@@ -23,6 +23,7 @@ flag axis, and real-HTTP body integration via the SELF loopback binding.
 [Exposed=Worker]
 interface CompressionStream {
   constructor(DOMString format);  // 'deflate' | 'gzip' | 'deflate-raw' | 'brotli'
+                                  // | 'zstd' (compression_stream_zstd)
   readonly attribute ReadableStream readable;
   readonly attribute WritableStream writable;
 };
@@ -127,7 +128,9 @@ The C++ cell pins every date-gated flag the implementation is subject to
 `unhandled_rejection_after_microtask_checkpoint` (isolate-level event
 timing), and the internal-testing `expose_draining_reader`. Both main
 cells also pin `nodejs_zlib`, which `formats.js` uses for its reference
-codecs; it has no effect on the classes under test.
+codecs (no effect on the classes under test), and the dateless opt-in
+`compression_stream_zstd`, which adds the `'zstd'` format; the legacy cell
+pins its absence (`legacyZstdFormatRejected`).
 
 `compression-cpp-pedantic.wd-test` runs the full shared module set with the
 dateless opt-in `pedantic_wpt` flag added to the main C++ cell's pinned
@@ -141,6 +144,7 @@ pedantic branches shifting anything the suite pins.
 | Flag (enable date) | Selects | Unflagged behavior tested by |
 | --- | --- | --- |
 | `strict_compression_checks` (2023-08-01) | DS trailing-data + incomplete-close errors | `legacy-nonstrict.js` |
+| `compression_stream_zstd` (opt-in, no date) | `'zstd'` accepted as a format | `legacyZstdFormatRejected` |
 | `capture_async_api_throws` (2022-10-31) | invalid chunk rejects instead of throwing synchronously | `legacyInvalidChunkThrowsSynchronously` |
 | `unhandled_rejection_after_microtask_checkpoint` (2026-03-03) | rejection-event timing the #6061 regression depends on | — |
 | internal-stream flags (BYOB, abort queue, getters, tags, error serialization; see config comment) | generic internal-stream behaviors | identity suite legacy cell |
@@ -174,7 +178,7 @@ pedantic branches shifting anything the suite pins.
 | `api-surface.js` | toStringTag branding; codec factory not exposed; side stability; inheritance/placement (#5); ctor name/length/source (#6); `node:stream/web` re-exports are the same classes; accessor brand checks |
 | `construction.js` | valid formats; invalid format exact message (case-sensitive); one-shot ToString coercion; non-string formats (#7) |
 | `round-trip.js` | all-formats round trips (compression verified smaller); parked-read service with pinned deflate bytes; shared pump/concat/readAll helpers |
-| `formats.js` | the non-zlib formats (brotli): interop with node:zlib's reference codecs in both directions; 16 KiB scratch-buffer boundary sizes; empty streams; strict trailing/incomplete-close messages; corrupt input |
+| `formats.js` | the non-zlib formats (brotli, zstd): interop with node:zlib's reference codecs in both directions; 16 KiB scratch-buffer boundary sizes; empty streams; strict incomplete-close message; a byte after the stream (brotli: trailing-data TypeError; zstd: "Decompression failed.", since any byte after a frame starts another frame); corrupt input; zstd concatenated frames (one write, per frame, split mid-frame, empty frame) and a truncated second frame rejecting close |
 | `chunk-boundaries.js` | byte-at-a-time compression; 2-byte split decompression; all formats with 5-byte write chunks |
 | `large-payload.js` | 400KB patterned payload, chunked writes, byte-exact round trip |
 | `empty-stream.js` | close-with-no-writes emits a valid empty member; decompressing it yields EOF |
@@ -206,6 +210,7 @@ Guarded by `compression-cpp-legacy.wd-test` (C++ only,
 | Trailing bytes after the member tolerated; member content delivered | `legacyTrailingDataTolerated` |
 | close() with no data tolerated (empty output) | `legacyCloseWithoutDataTolerated` |
 | close() mid-member tolerated | `legacyTruncatedMemberCloseTolerated` |
+| `'zstd'` rejected as a format | `legacyZstdFormatRejected` |
 | Invalid chunk throws synchronously; the stream survives | `legacyInvalidChunkThrowsSynchronously` |
 
 Generic pre-flag internal-stream behaviors (BYOB in-place fills, property
