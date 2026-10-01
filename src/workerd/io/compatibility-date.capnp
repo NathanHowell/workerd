@@ -1725,4 +1725,12 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   # bookmark as an opaque handle that can be passed over RPC, and
   # DurableObjectStorage.onNextSessionRestore(), which restores a snapshot or bookmark when the
   # next session starts. The experimental catch-all flag also exposes these methods.
+
+  compressionStreamZstd @196 :Bool
+      $compatEnableFlag("compression_stream_zstd");
+  # Accepts "zstd" as a CompressionStream/DecompressionStream format. Zstandard is not part of
+  # the Compression Streams standard, so this is opt-in; the format name or details of its
+  # behavior may change if the standard adopts it. A DecompressionStream decodes every frame of
+  # a concatenated zstd stream, and bytes after the last frame that do not start another frame
+  # fail as corrupt input rather than as trailing data.
 }

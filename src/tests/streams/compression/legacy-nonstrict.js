@@ -85,3 +85,16 @@ export const legacyInvalidChunkThrowsSynchronously = {
     await writer.close();
   },
 };
+
+// Without compression_stream_zstd, "zstd" is just another invalid format.
+export const legacyZstdFormatRejected = {
+  test() {
+    for (const Ctor of [CompressionStream, DecompressionStream]) {
+      throws(() => new Ctor('zstd'), {
+        constructor: TypeError,
+        message:
+          "The compression format must be either 'deflate', 'deflate-raw', 'gzip' or 'brotli'.",
+      });
+    }
+  },
+};

@@ -11,11 +11,20 @@ import { ok, strictEqual, rejects } from 'node:assert';
 import zlib from 'node:zlib';
 import { pump } from 'round-trip';
 
-// format -> node:zlib reference codec.
+// format -> node:zlib reference codec, plus the error a byte appended after
+// the end of the stream produces. brotli stops at the end of its stream, so
+// the stage's trailing-data check sees the byte; zstd treats anything after a
+// frame as the start of another frame, so the byte is corrupt input.
 export const referenceCodecs = {
   brotli: {
     compress: (bytes) => zlib.brotliCompressSync(bytes),
     decompress: (bytes) => zlib.brotliDecompressSync(bytes),
+    trailingMessage: 'Trailing bytes after end of compressed data',
+  },
+  zstd: {
+    compress: (bytes) => zlib.zstdCompressSync(bytes),
+    decompress: (bytes) => zlib.zstdDecompressSync(bytes),
+    trailingMessage: 'Decompression failed.',
   },
 };
 
@@ -127,7 +136,7 @@ export const strictChecks = {
         referenceCodecs[format].compress(payload)
       );
 
-      // Trailing bytes after the end of the stream reject the write.
+      // A byte after the end of the stream rejects the write.
       {
         const trailing = new Uint8Array(compressed.byteLength + 1);
         trailing.set(compressed);
@@ -135,7 +144,7 @@ export const strictChecks = {
         const writer = new DecompressionStream(format).writable.getWriter();
         await rejects(writer.write(trailing), {
           constructor: TypeError,
-          message: 'Trailing bytes after end of compressed data',
+          message: referenceCodecs[format].trailingMessage,
         });
       }
 
@@ -172,5 +181,57 @@ export const corruptInputRejectsWrite = {
         { constructor: TypeError, message: 'Decompression failed.' }
       );
     }
+  },
+};
+
+// A zstd stream is a sequence of frames (RFC 8878); the decompressor decodes
+// all of them, including across write boundaries and an empty frame.
+export const zstdConcatenatedFrames = {
+  async test() {
+    const parts = [
+      patterned(20_000, 1),
+      new Uint8Array(0),
+      patterned(40_000, 2),
+    ];
+    const frames = parts.map((p) => new Uint8Array(zlib.zstdCompressSync(p)));
+    const expected = new Uint8Array(60_000);
+    expected.set(parts[0]);
+    expected.set(parts[2], 20_000);
+
+    const oneWrite = await pump(new DecompressionStream('zstd'), [
+      new Uint8Array([...frames[0], ...frames[1], ...frames[2]]),
+    ]);
+    ok(equalBytes(oneWrite, expected), 'frames in one write');
+
+    const perFrame = await pump(new DecompressionStream('zstd'), frames);
+    ok(equalBytes(perFrame, expected), 'one frame per write');
+
+    // A frame boundary inside a write, with the rest of the second frame later.
+    const joined = new Uint8Array([...frames[0], ...frames[2]]);
+    const cut = frames[0].byteLength + 5;
+    const split = await pump(new DecompressionStream('zstd'), [
+      joined.subarray(0, cut),
+      joined.subarray(cut),
+    ]);
+    ok(
+      equalBytes(split, new Uint8Array([...parts[0], ...parts[2]])),
+      'frame boundary mid-write'
+    );
+  },
+};
+
+// The second frame of a concatenated stream is subject to the same incomplete
+// close check as the first.
+export const zstdTruncatedSecondFrameRejectsClose = {
+  async test() {
+    const first = new Uint8Array(zlib.zstdCompressSync(patterned(1000, 3)));
+    const second = new Uint8Array(zlib.zstdCompressSync(patterned(1000, 4)));
+    const writer = new DecompressionStream('zstd').writable.getWriter();
+    await writer.write(first);
+    await writer.write(second.subarray(0, second.byteLength - 3));
+    await rejects(writer.close(), {
+      constructor: TypeError,
+      message: 'Called close() on a decompression stream with incomplete data',
+    });
   },
 };

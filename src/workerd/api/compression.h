@@ -141,11 +141,13 @@ class ZlibStream final {
 // timing is observable and WPT-pinned. Demand-paced production (pump only what a reader
 // asked for) is therefore NOT valid on any frontend where write settlement is observable; it
 // remains a possible future policy for fused native pipelines that own both ends.
-// The Compression Streams formats: the spec's CompressionFormat enum.
-enum class CodecFormat { DEFLATE, DEFLATE_RAW, GZIP, BROTLI };
+// The Compression Streams formats: the spec's CompressionFormat enum plus zstd, workerd's
+// extension behind the compression_stream_zstd compat flag.
+enum class CodecFormat { DEFLATE, DEFLATE_RAW, GZIP, BROTLI, ZSTD };
 
 // The frontends' shared constructor-argument validation: maps the (already ToString-coerced)
-// format to a CodecFormat, throwing the spec-pinned TypeError for anything else.
+// format to a CodecFormat, honoring the compat flags that gate formats, and throws the
+// spec-pinned TypeError for anything else.
 CodecFormat requireCodecFormat(jsg::Lock& js, kj::StringPtr format);
 
 // One codec library behind the stage: the input/output plumbing and a single codec step, in
@@ -542,6 +544,7 @@ class ZstdDecoderContext final: public ZstdContext {
   kj::Own<ZSTD_DCtx> dctx_;
   ZSTD_ErrorCode error_ = ZSTD_error_no_error;
   bool frameInProgress_ = false;
+  bool frameComplete_ = false;
 };
 
 }  // namespace workerd::api

@@ -36,6 +36,8 @@ export {
   emptyStreams,
   strictChecks,
   corruptInputRejectsWrite,
+  zstdConcatenatedFrames,
+  zstdTruncatedSecondFrameRejectsClose,
 } from 'formats';
 
 export {
