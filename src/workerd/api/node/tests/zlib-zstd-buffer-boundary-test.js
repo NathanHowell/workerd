@@ -13,8 +13,16 @@
 //    needs further passes to flush the rest of the frame. This is only
 //    reachable with poorly compressible input.
 //
-// The compression tests verify the output structurally (see walkFrame) rather
-// than by decompressing it with zstdDecompressSync.
+//  * Decompression: a valid frame whose last byte lands exactly on a buffer
+//    boundary makes the loop run once more with no input left, which must not
+//    be mistaken for truncation. This is only reachable when the decompressed
+//    size is exactly 40960 * 2^k.
+//
+// To keep compression and decompression independent, the decompression tests
+// use frames built by hand from raw/RLE blocks (see buildFrame) instead of
+// frames produced by zstdCompressSync, and the compression tests verify the
+// output structurally (see walkFrame) instead of decompressing it with
+// zstdDecompressSync.
 
 import assert from 'node:assert';
 import { Buffer } from 'node:buffer';
@@ -54,6 +62,11 @@ function randomBuffer(n, seed = 0x12345678) {
 function repetitiveBuffer(n) {
   return Buffer.alloc(n, 7);
 }
+
+const DATA_KINDS = {
+  random: randomBuffer,
+  repetitive: repetitiveBuffer,
+};
 
 // Build a valid zstd frame out of uncompressed blocks. `kind` selects raw
 // blocks (which carry the data verbatim, so any content works) or RLE blocks
@@ -261,6 +274,14 @@ function sizeCases(deltas) {
 function callbackCompress(input, opts) {
   return new Promise((resolve, reject) => {
     zlib.zstdCompress(input, opts ?? {}, (err, res) =>
+      err ? reject(err) : resolve(res)
+    );
+  });
+}
+
+function callbackDecompress(input, opts) {
+  return new Promise((resolve, reject) => {
+    zlib.zstdDecompress(input, opts ?? {}, (err, res) =>
       err ? reject(err) : resolve(res)
     );
   });
@@ -581,5 +602,401 @@ export const zstdCompressStreamChunkSizesTest = {
       );
       assertCompleteFrames(out, `chunkSize=${chunkSize}`);
     });
+  },
+};
+
+// Full round trip through workerd's own compressor and decompressor.
+export const zstdRoundTripRandomSyncTest = {
+  test() {
+    forEachCase(sizeCases(DELTAS), ({ n }) => {
+      const raw = randomBuffer(n);
+      const out = zlib.zstdDecompressSync(zlib.zstdCompressSync(raw));
+      assert(out.equals(raw), `n=${n} round trip mismatch`);
+    });
+  },
+};
+
+export const zstdRoundTripRepetitiveSyncTest = {
+  test() {
+    forEachCase(sizeCases(DELTAS), ({ n }) => {
+      const raw = repetitiveBuffer(n);
+      const out = zlib.zstdDecompressSync(zlib.zstdCompressSync(raw));
+      assert(out.equals(raw), `n=${n} round trip mismatch`);
+    });
+  },
+};
+
+export const zstdRoundTripCallbackTest = {
+  async test() {
+    const cases = [];
+    for (const kind of Object.keys(DATA_KINDS)) {
+      for (const n of [BASE - 1, BASE, BASE + 1, BASE * 2]) {
+        cases.push({ kind, n, label: `${kind} n=${n}` });
+      }
+    }
+    await forEachCaseAsync(cases, async ({ kind, n }) => {
+      const raw = DATA_KINDS[kind](n);
+      const compressed = await callbackCompress(raw);
+      const out = await callbackDecompress(compressed);
+      assert(out.equals(raw), 'round trip mismatch');
+    });
+  },
+};
+
+export const zstdRoundTripStreamTest = {
+  async test() {
+    const cases = [];
+    for (const kind of Object.keys(DATA_KINDS)) {
+      for (const n of [BASE - 1, BASE, BASE + 1, BASE * 2]) {
+        cases.push({ kind, n, label: `${kind} n=${n}` });
+      }
+    }
+    await forEachCaseAsync(cases, async ({ kind, n }) => {
+      const raw = DATA_KINDS[kind](n);
+      const compressed = await streamThrough(zlib.createZstdCompress(), raw);
+      const out = await streamThrough(zlib.createZstdDecompress(), compressed);
+      assert(out.equals(raw), 'round trip mismatch');
+    });
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Decompression of a frame whose decompressed size is exactly 40960 * 2^k. The
+// sync and callback loops call the decoder once more after the output buffer
+// fills, with no input left.
+
+export const zstdDecompressExactBoundaryTest = {
+  test() {
+    // Issue repro: constant bytes at 40960, 81920 and 163840.
+    for (const n of [40960, 81920, 163840]) {
+      const raw = repetitiveBuffer(n);
+      const out = zlib.zstdDecompressSync(zlib.zstdCompressSync(raw));
+      assert(out.equals(raw), `n=${n} should round trip`);
+    }
+  },
+};
+
+function rawFor(kind, n) {
+  return kind === 'repetitive' ? repetitiveBuffer(n) : randomBuffer(n);
+}
+
+// Decode hand-built frames (no workerd compressor involved) at every size
+// around each buffer boundary.
+function handBuiltDecompressTest(kind, contentSize) {
+  return {
+    test() {
+      forEachCase(sizeCases(DELTAS), ({ n }) => {
+        const frame = buildFrameFor(kind, n, { contentSize });
+        const out = zlib.zstdDecompressSync(frame);
+        assert(out.equals(rawFor(kind, n)), `n=${n} decoded bytes differ`);
+      });
+    },
+  };
+}
+
+export const zstdDecompressHandBuiltRepetitiveNoContentSizeTest =
+  handBuiltDecompressTest('repetitive', false);
+export const zstdDecompressHandBuiltRepetitiveWithContentSizeTest =
+  handBuiltDecompressTest('repetitive', true);
+export const zstdDecompressHandBuiltRandomNoContentSizeTest =
+  handBuiltDecompressTest('random', false);
+export const zstdDecompressHandBuiltRandomWithContentSizeTest =
+  handBuiltDecompressTest('random', true);
+
+// Splits `total` bytes into blocks no larger than the zstd maximum.
+function splitBlocks(total) {
+  const sizes = [];
+  for (let left = total; left > 0; left -= MAX_BLOCK_SIZE) {
+    sizes.push(Math.min(left, MAX_BLOCK_SIZE));
+  }
+  return sizes;
+}
+
+// Frames made of several blocks, so the output boundary can fall between
+// blocks as well as inside one.
+export const zstdDecompressMultiBlockBoundaryTest = {
+  test() {
+    const cases = [];
+    for (const n of BOUNDARIES.slice(0, 4)) {
+      const q = n / 4;
+      cases.push({ n, sizes: [q, q, q, q], label: `n=${n} 4 equal blocks` });
+      cases.push({
+        n,
+        sizes: [...splitBlocks(n - 1), 1],
+        label: `n=${n} trailing 1-byte block`,
+      });
+      cases.push({
+        n,
+        sizes: [1, ...splitBlocks(n - 1)],
+        label: `n=${n} leading 1-byte block`,
+      });
+      cases.push({
+        n,
+        sizes: [...splitBlocks(n), 0],
+        label: `n=${n} trailing empty last block`,
+      });
+    }
+    forEachCase(cases, ({ n, sizes }) => {
+      const raw = randomBuffer(n);
+      const frame = buildFrame(raw, 'raw', { blockSizes: sizes });
+      const out = zlib.zstdDecompressSync(frame);
+      assert(out.equals(raw), 'decoded bytes differ');
+    });
+  },
+};
+
+// chunkSize is validated but doesn't size the output buffer, so it must not
+// change the outcome at the boundary.
+export const zstdDecompressChunkSizeIgnoredTest = {
+  test() {
+    const frame = buildFrameFor('repetitive', BASE);
+    const raw = repetitiveBuffer(BASE);
+    forEachCase(
+      [64, 1024, 16384, 40960, 65536, 1024 * 1024].map((chunkSize) => ({
+        chunkSize,
+        label: `chunkSize=${chunkSize}`,
+      })),
+      ({ chunkSize }) => {
+        const out = zlib.zstdDecompressSync(frame, { chunkSize });
+        assert(out.equals(raw), 'decoded bytes differ');
+      }
+    );
+  },
+};
+
+// maxOutputLength equal to the exact decoded size is allowed; one less is not.
+export const zstdDecompressMaxOutputLengthBoundaryTest = {
+  test() {
+    forEachCase(sizeCases([0]), ({ n }) => {
+      const frame = buildFrameFor('repetitive', n);
+      const out = zlib.zstdDecompressSync(frame, { maxOutputLength: n });
+      assert.strictEqual(out.length, n);
+      assert.throws(
+        () => zlib.zstdDecompressSync(frame, { maxOutputLength: n - 1 }),
+        { name: 'RangeError', message: /Memory limit exceeded/ }
+      );
+    });
+  },
+};
+
+export const zstdDecompressCallbackBoundaryTest = {
+  async test() {
+    const cases = [];
+    for (const kind of ['repetitive', 'random']) {
+      for (const n of [BASE - 1, BASE, BASE + 1, BASE * 2, BASE * 4]) {
+        cases.push({ kind, n, label: `${kind} n=${n}` });
+      }
+    }
+    await forEachCaseAsync(cases, async ({ kind, n }) => {
+      const out = await callbackDecompress(buildFrameFor(kind, n));
+      assert(out.equals(rawFor(kind, n)), 'decoded bytes differ');
+    });
+  },
+};
+
+// The streaming decoder has its own output chunking and doesn't loop on a full
+// buffer, but it must decode the same inputs.
+export const zstdDecompressStreamBoundaryTest = {
+  async test() {
+    const cases = [];
+    for (const kind of ['repetitive', 'random']) {
+      for (const n of [BASE - 1, BASE, BASE + 1, BASE * 2, BASE * 4]) {
+        cases.push({ kind, n, label: `${kind} n=${n}` });
+      }
+    }
+    await forEachCaseAsync(cases, async ({ kind, n }) => {
+      const out = await streamThrough(
+        zlib.createZstdDecompress(),
+        buildFrameFor(kind, n)
+      );
+      assert(out.equals(rawFor(kind, n)), 'decoded bytes differ');
+    });
+  },
+};
+
+export const zstdDecompressStreamChunkSizesTest = {
+  async test() {
+    const cases = [];
+    for (const chunkSize of [64, 1024, 16384, 40960, 65536]) {
+      for (const n of [BASE, BASE * 2]) {
+        cases.push({ chunkSize, n, label: `chunkSize=${chunkSize} n=${n}` });
+      }
+    }
+    await forEachCaseAsync(cases, async ({ chunkSize, n }) => {
+      const out = await streamThrough(
+        zlib.createZstdDecompress({ chunkSize }),
+        buildFrameFor('repetitive', n)
+      );
+      assert(out.equals(repetitiveBuffer(n)), 'decoded bytes differ');
+    });
+  },
+};
+
+// Input arriving in small writes, so the exact fill happens mid-write.
+export const zstdDecompressStreamSmallWritesTest = {
+  async test() {
+    const cases = [BASE, BASE * 2].map((n) => ({ n, label: `n=${n}` }));
+    await forEachCaseAsync(cases, async ({ n }) => {
+      const out = await streamThrough(
+        zlib.createZstdDecompress(),
+        buildFrameFor('random', n),
+        1000
+      );
+      assert(out.equals(randomBuffer(n)), 'decoded bytes differ');
+    });
+  },
+};
+
+// Empty frames decode to empty output.
+export const zstdDecompressEmptyFrameTest = {
+  test() {
+    for (const contentSize of [false, true]) {
+      const frame = buildFrame(Buffer.alloc(0), 'raw', { contentSize });
+      assert.strictEqual(zlib.zstdDecompressSync(frame).length, 0);
+    }
+    assert.strictEqual(
+      zlib.zstdDecompressSync(zlib.zstdCompressSync(Buffer.alloc(0))).length,
+      0
+    );
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Truncation is detected, including when the decoder has already produced
+// exactly as many bytes as fit in the output buffer. Stopping the decode loop as
+// soon as the output is full, or as soon as the input is consumed, would turn
+// these into silent successes.
+
+function truncatedFrames(n) {
+  const raw = randomBuffer(n);
+  const frames = [];
+
+  // All data present, but the final block isn't marked as last.
+  frames.push({
+    label: `n=${n} no last-block flag`,
+    frame: buildFrame(raw, 'raw', { lastBlock: false }),
+  });
+
+  // All data present in a non-last block; the next block header is missing.
+  frames.push({
+    label: `n=${n} missing next block header`,
+    frame: buildFrame(raw, 'raw', {
+      blockSizes: [...splitBlocks(n - 1), 1],
+      lastBlock: false,
+    }),
+  });
+
+  // Checksum flag set, all blocks present, checksum bytes missing.
+  frames.push({
+    label: `n=${n} missing checksum`,
+    frame: buildFrame(raw, 'raw', { checksum: true }),
+  });
+
+  // Checksum flag set, only part of the checksum present.
+  frames.push({
+    label: `n=${n} partial checksum`,
+    frame: buildFrame(raw, 'raw', {
+      checksum: true,
+      checksumBytes: Buffer.from([1, 2]),
+    }),
+  });
+
+  // Final block's data is one byte short.
+  const complete = buildFrame(raw, 'raw');
+  frames.push({
+    label: `n=${n} last byte missing`,
+    frame: complete.subarray(0, complete.length - 1),
+  });
+
+  // The frame ends partway through a block header.
+  const withTrailingBlock = buildFrame(raw, 'raw', {
+    blockSizes: [...splitBlocks(n), 0],
+  });
+  frames.push({
+    label: `n=${n} partial block header`,
+    frame: withTrailingBlock.subarray(0, withTrailingBlock.length - 1),
+  });
+  return frames;
+}
+
+function truncatedCases(sizes) {
+  const cases = [];
+  for (const n of sizes) cases.push(...truncatedFrames(n));
+  return cases;
+}
+
+const TRUNCATION_SIZES = [BASE - 1, BASE, BASE + 1, BASE * 2];
+
+export const zstdTruncatedAtBoundarySyncTest = {
+  test() {
+    forEachCase(truncatedCases(TRUNCATION_SIZES), ({ frame }) => {
+      assert.throws(() => zlib.zstdDecompressSync(frame), Error);
+    });
+  },
+};
+
+export const zstdTruncatedAtBoundaryCallbackTest = {
+  async test() {
+    await forEachCaseAsync(
+      truncatedCases(TRUNCATION_SIZES),
+      async ({ frame }) => {
+        await assert.rejects(callbackDecompress(frame), Error);
+      }
+    );
+  },
+};
+
+export const zstdTruncatedAtBoundaryStreamTest = {
+  async test() {
+    await forEachCaseAsync(
+      truncatedCases(TRUNCATION_SIZES),
+      async ({ frame }) => {
+        await assert.rejects(
+          streamThrough(zlib.createZstdDecompress(), frame),
+          Error
+        );
+      }
+    );
+  },
+};
+
+// Every possible cut point of a small multi-block frame must be rejected.
+export const zstdTruncatedEveryCutPointTest = {
+  test() {
+    const frame = buildFrame(randomBuffer(300), 'raw', {
+      blockSizes: [100, 100, 100],
+      checksum: true,
+      checksumBytes: Buffer.alloc(4),
+    });
+    const cases = [];
+    for (let cut = 1; cut < frame.length; cut++) {
+      cases.push({ cut, label: `cut=${cut}` });
+    }
+    forEachCase(cases, ({ cut }) => {
+      assert.throws(
+        () => zlib.zstdDecompressSync(frame.subarray(0, cut)),
+        Error
+      );
+    });
+  },
+};
+
+// Same, for compressor-produced output that is cut exactly where the output
+// buffer would have filled.
+export const zstdTruncatedCompressedAtBufferSizeTest = {
+  test() {
+    const compressed = zlib.zstdCompressSync(repetitiveBuffer(BASE * 2));
+    forEachCase(
+      [compressed.length - 1, compressed.length - 4].map((cut) => ({
+        cut,
+        label: `cut=${cut}`,
+      })),
+      ({ cut }) => {
+        assert.throws(
+          () => zlib.zstdDecompressSync(compressed.subarray(0, cut)),
+          Error
+        );
+      }
+    );
   },
 };

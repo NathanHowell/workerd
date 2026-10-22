@@ -715,6 +715,14 @@ void ZstdDecoderContext::work() {
   JSG_REQUIRE(mode == ZlibMode::ZSTD_DECODE, Error, "Mode should be ZSTD_DECODE"_kj);
   JSG_REQUIRE(dctx_.get() != nullptr, Error, "Zstd context should not be null"_kj);
 
+  // Once a frame is complete, ZSTD_decompressStream() treats the next call as the start of a
+  // new frame; given no input it just reports how many header bytes it wants. Callers re-invoke
+  // work() whenever the previous call filled the output buffer, so that case must leave the
+  // completed-frame result untouched or the truncation check below would misfire.
+  if (!frameInProgress_ && input_.pos >= input_.size) {
+    return;
+  }
+
   lastResult = ZSTD_decompressStream(dctx_.get(), &output_, &input_);
 
   if (ZSTD_isError(lastResult)) {
