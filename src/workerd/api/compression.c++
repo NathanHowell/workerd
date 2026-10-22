@@ -723,15 +723,19 @@ void ZstdDecoderContext::work() {
     return;
   }
 
-  lastResult = ZSTD_decompressStream(dctx_.get(), &output_, &input_);
+  do {
+    lastResult = ZSTD_decompressStream(dctx_.get(), &output_, &input_);
+    if (ZSTD_isError(lastResult)) {
+      error_ = ZSTD_getErrorCode(lastResult);
+      return;
+    }
+    // A return of 0 means a frame has been fully decoded and flushed. A zstd stream may consist
+    // of several concatenated frames, so any remaining input is the next frame (or trailing
+    // garbage, which the next call rejects); keep decoding while there is room for output.
+  } while (lastResult == 0 && input_.pos < input_.size && output_.pos < output_.size);
 
-  if (ZSTD_isError(lastResult)) {
-    error_ = ZSTD_getErrorCode(lastResult);
-  } else if (input_.size > 0) {
-    // Track whether we're mid-frame: lastResult > 0 means more data needed,
-    // lastResult == 0 means frame is complete.
-    frameInProgress_ = (lastResult > 0);
-  }
+  // lastResult > 0 means the decoder needs more input or output to finish the current frame.
+  frameInProgress_ = (lastResult > 0);
 }
 
 kj::Maybe<CompressionError> ZstdDecoderContext::resetStream() {

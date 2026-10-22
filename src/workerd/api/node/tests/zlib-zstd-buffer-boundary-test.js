@@ -18,6 +18,9 @@
 //    be mistaken for truncation. This is only reachable when the decompressed
 //    size is exactly 40960 * 2^k.
 //
+//  * Concatenated frames: a zstd stream is one or more frames, and all of them
+//    are decoded.
+//
 // To keep compression and decompression independent, the decompression tests
 // use frames built by hand from raw/RLE blocks (see buildFrame) instead of
 // frames produced by zstdCompressSync, and the compression tests verify the
@@ -998,5 +1001,98 @@ export const zstdTruncatedCompressedAtBufferSizeTest = {
         );
       }
     );
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Concatenated frames decode to the concatenation of their payloads, including
+// when the output buffer fills exactly at a frame boundary. These use
+// hand-built frames so they're independent of the compressor.
+
+function concatCases() {
+  const cases = [];
+  const pairs = [
+    [BASE, BASE],
+    [BASE, 1],
+    [BASE - 1, 1],
+    [1, BASE - 1],
+    [BASE - 16, 16],
+    [BASE * 2, 5],
+    [BASE, BASE * 2],
+    [5, BASE * 2 - 5],
+  ];
+  for (const [a, b] of pairs) {
+    cases.push({ sizes: [a, b], label: `[${a}, ${b}]` });
+  }
+  cases.push({ sizes: [BASE, BASE, BASE], label: `[${BASE} x3]` });
+  cases.push({ sizes: [BASE, 0, BASE], label: `[${BASE}, empty, ${BASE}]` });
+  return cases;
+}
+
+function concatFrames(sizes) {
+  const raws = sizes.map((n, i) => randomBuffer(n, 0x1000 + i));
+  const frame = Buffer.concat(
+    raws.map((raw, i) => buildFrame(raw, 'raw', { contentSize: i % 2 === 0 }))
+  );
+  return { raw: Buffer.concat(raws), frame };
+}
+
+export const zstdConcatenatedFramesSyncTest = {
+  test() {
+    forEachCase(concatCases(), ({ sizes }) => {
+      const { raw, frame } = concatFrames(sizes);
+      const out = zlib.zstdDecompressSync(frame);
+      assert(out.equals(raw), 'decoded bytes differ');
+    });
+  },
+};
+
+export const zstdConcatenatedFramesCallbackTest = {
+  async test() {
+    await forEachCaseAsync(concatCases(), async ({ sizes }) => {
+      const { raw, frame } = concatFrames(sizes);
+      const out = await callbackDecompress(frame);
+      assert(out.equals(raw), 'decoded bytes differ');
+    });
+  },
+};
+
+export const zstdConcatenatedFramesStreamTest = {
+  async test() {
+    await forEachCaseAsync(concatCases(), async ({ sizes }) => {
+      const { raw, frame } = concatFrames(sizes);
+      const out = await streamThrough(zlib.createZstdDecompress(), frame);
+      assert(out.equals(raw), 'decoded bytes differ');
+    });
+  },
+};
+
+// Frames from workerd's own compressor, kept well away from the boundaries so
+// this exercises multi-frame handling on its own.
+export const zstdConcatenatedCompressorFramesTest = {
+  test() {
+    const a = randomBuffer(1000, 1);
+    const b = repetitiveBuffer(5000);
+    const c = randomBuffer(3000, 3);
+    const frame = Buffer.concat([a, b, c].map((x) => zlib.zstdCompressSync(x)));
+    const out = zlib.zstdDecompressSync(frame);
+    assert(out.equals(Buffer.concat([a, b, c])), 'decoded bytes differ');
+  },
+};
+
+// A complete first frame that exactly fills the output buffer, followed by a
+// truncated second frame, must still be reported as truncated.
+export const zstdConcatenatedSecondFrameTruncatedTest = {
+  test() {
+    const first = buildFrameFor('random', BASE);
+    const second = buildFrameFor('random', 100);
+    const cases = [];
+    for (const cut of [1, 3, 5, 8, second.length - 1]) {
+      cases.push({ cut, label: `second frame cut=${cut}` });
+    }
+    forEachCase(cases, ({ cut }) => {
+      const frame = Buffer.concat([first, second.subarray(0, cut)]);
+      assert.throws(() => zlib.zstdDecompressSync(frame), Error);
+    });
   },
 };
